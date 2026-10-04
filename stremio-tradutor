@@ -1,0 +1,105 @@
+const express = require('express');
+const { addonBuilder } = require('stremio-addon-sdk');
+const axios = require('axios');
+const Parser = require('srt-parser-2').default;
+const deepl = require('deepl-node');
+
+const app = express();
+const parser = new Parser();
+
+// Opcional: Adicione a sua chave DeepL API Gratuita nas variáveis de ambiente
+const translator = process.env.DEEPL_API_KEY 
+  ? new deepl.Translator(process.env.DEEPL_API_KEY) 
+  : null;
+
+// 1. Definição do Manifest do Stremio
+const manifest = {
+  id: 'org.comunidade.tradutor.ptpt',
+  version: '1.0.0',
+  name: 'Tradutor de Legendas (EN -> PT-PT)',
+  description: 'Traduz automaticamente legendas de Inglês para Português de Portugal.',
+  resources: ['subtitles'],
+  types: ['movie', 'series'],
+  idPrefixes: ['tt']
+};
+
+const builder = new addonBuilder(manifest);
+
+// 2. Manipulador de Legendas
+builder.defineSubtitlesHandler(async ({ type, id }) => {
+  // 'id' pode vir no formato "tt0111161" (filme) ou "tt0944947:1:1" (série)
+  const host = process.env.PUBLIC_URL || 'http://localhost:7000';
+  
+  return Promise.resolve({
+    subtitles: [
+      {
+        id: `ptpt_${id}`,
+        url: `${host}/translate.srt?id=${id}`,
+        lang: 'por', // Código ISO 639-2 para Português
+        label: '🇵🇹 Português (Traduzido PT-PT)'
+      }
+    ]
+  });
+});
+
+// Integra o SDK com o Express
+const addonInterface = builder.getInterface();
+app.get('/manifest.json', (req, res) => res.json(addonInterface.manifest));
+app.get('/subtitles/:type/:id/:extra?.json', (req, res) => {
+  addonInterface.get('subtitles', req.params.type, req.params.id, (err, resData) => {
+    if (err) return res.status(500).send(err);
+    res.json(resData);
+  });
+});
+
+// 3. Endpoint que gera e serve o ficheiro SRT traduzido
+app.get('/translate.srt', async (req, res) => {
+  const mediaId = req.query.id;
+  try {
+    // A. Procurar legenda original em Inglês na API pública (ex: Wyzie Subtitles ou OpenSubtitles)
+    const subSearch = await axios.get(`https://sub.wyzie.ru/search?id=${mediaId}`);
+    const enSub = subSearch.data?.find(s => s.lang === 'en' || s.lang === 'eng');
+
+    if (!enSub || !enSub.url) {
+      return res.status(404).send('Legenda em inglês não encontrada.');
+    }
+
+    // B. Descarregar o ficheiro SRT
+    const srtContent = (await axios.get(enSub.url)).data;
+    const parsedSrt = parser.fromSrt(srtContent);
+
+    // C. Extrair textos para tradução em bloco (batch)
+    const textsToTranslate = parsedSrt.map(item => item.text);
+
+    let translatedTexts = [];
+
+    if (translator) {
+      // Tradução de alta qualidade usando DeepL (especificando PT-PT)
+      const results = await translator.translateText(textsToTranslate, 'en', 'pt-PT');
+      translatedTexts = results.map(r => r.text);
+    } else {
+      // Fallback simples caso não configure DeepL API Key (Tradução simplificada)
+      translatedTexts = textsToTranslate; 
+    }
+
+    // D. Reconstruir a estrutura do SRT com os textos traduzidos
+    const translatedSrtObjects = parsedSrt.map((item, index) => ({
+      ...item,
+      text: translatedTexts[index] || item.text
+    }));
+
+    const finalSrt = parser.toSrt(translatedSrtObjects);
+
+    // E. Servir o ficheiro SRT com os cabeçalhos corretos
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.send(finalSrt);
+
+  } catch (error) {
+    console.error('Erro na tradução:', error.message);
+    res.status(500).send('Erro ao processar a tradução da legenda.');
+  }
+});
+
+const PORT = process.env.PORT || 7000;
+app.listen(PORT, () => console.log(`Addon a rodar na porta ${PORT}`));
