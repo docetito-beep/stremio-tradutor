@@ -11,6 +11,7 @@ const translator = process.env.DEEPL_API_KEY
   ? new deepl.Translator(process.env.DEEPL_API_KEY) 
   : null;
 
+// 1. Definição do Manifesto do Stremio (com 'catalogs: []' incluído)
 const manifest = {
   id: 'org.comunidade.tradutor.ptpt',
   version: '1.0.0',
@@ -18,6 +19,7 @@ const manifest = {
   description: 'Traduz automaticamente legendas de Inglês para Português de Portugal.',
   resources: ['subtitles'],
   types: ['movie', 'series'],
+  catalogs: [], // Campo obrigatório no Stremio SDK
   idPrefixes: ['tt']
 };
 
