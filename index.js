@@ -7,7 +7,7 @@ const deepl = require('deepl-node');
 const app = express();
 const parser = new Parser();
 
-// 1. Configurar cabeçalhos CORS globais para Stremio Web e Android Box
+// 1. Configurar cabeçalhos CORS globais para Stremio Web / Android Box
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', '*');
@@ -23,7 +23,7 @@ const http = axios.create({
   headers: {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'
   },
-  timeout: 10000
+  timeout: 12000
 });
 
 // 2. Definição do Manifesto do Stremio
@@ -58,7 +58,7 @@ builder.defineSubtitlesHandler(async ({ type, id }) => {
   };
 });
 
-// 4. Endpoint do ficheiro SRT com Tradução Ultra-Rápida em Paralelo
+// 4. Endpoint do ficheiro SRT
 app.get('/translate.srt', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -73,17 +73,23 @@ app.get('/translate.srt', async (req, res) => {
   console.log(`[Legenda] Pedido recebido para ID: ${fullId}`);
 
   try {
-    const mediaId = fullId.split(':')[0]; // Remove temporada/episódio caso seja série
+    const mediaId = fullId.split(':')[0]; // Trata IDs de filmes e séries
 
-    // A. Procurar legenda original em inglês na Wyzie
-    const subSearch = await http.get(`https://sub.wyzie.ru/search?id=${mediaId}`);
-    const subList = subSearch.data;
-
-    if (!Array.isArray(subList) || subList.length === 0) {
-      console.log(`[Legenda] Nenhuma legenda encontrada para ${mediaId}`);
-      return res.status(200).send("1\r\n00:00:01,000 --> 00:00:05,000\r\nLegenda original não encontrada.\r\n\r\n");
+    // A. Pesquisa de legenda original
+    let subSearch;
+    try {
+      subSearch = await http.get(`https://sub.wyzie.ru/search?id=${mediaId}`);
+    } catch (wyzieErr) {
+      console.error('[Wyzie Error]:', wyzieErr.message);
+      return res.status(200).send(`1\r\n00:00:01,000 --> 00:00:05,000\r\nErro ao procurar legenda no Wyzie: ${wyzieErr.message}\r\n\r\n`);
     }
 
+    const subList = subSearch.data;
+    if (!Array.isArray(subList) || subList.length === 0) {
+      return res.status(200).send("1\r\n00:00:01,000 --> 00:00:05,000\r\nNenhuma legenda em inglês encontrada.\r\n\r\n");
+    }
+
+    // B. Download do ficheiro SRT
     const enSub = subList.find(s => s.lang === 'en' || s.lang === 'eng') || subList[0];
     const srtDownload = await http.get(enSub.url);
     let rawSrt = srtDownload.data;
@@ -92,11 +98,9 @@ app.get('/translate.srt', async (req, res) => {
       rawSrt = String(rawSrt);
     }
 
-    // B. Parser de SRT Robusto via srt-parser-2
+    // C. Parser do SRT
     const parsedSrt = parser.fromSrt(rawSrt);
-
     if (!parsedSrt || parsedSrt.length === 0) {
-      console.log(`[Legenda] Não foi possível estruturar o SRT. Enviando texto bruto.`);
       const cleanRaw = rawSrt.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n');
       return res.status(200).send(cleanRaw);
     }
@@ -104,32 +108,27 @@ app.get('/translate.srt', async (req, res) => {
     const textsToTranslate = parsedSrt.map(item => item.text);
     let translatedTexts = [];
 
-    // C. Tradução Paralela com Promise.all (Lotes de 100 linhas em simultâneo)
+    // D. Tradução em lotes otimizados de 200 linhas (evita erro 429 do DeepL)
     if (translator) {
-      console.log(`[Legenda] Traduzindo ${textsToTranslate.length} linhas em PARALELO...`);
-      const CHUNK_SIZE = 100;
-      const chunks = [];
-      for (let i = 0; i < textsToTranslate.length; i += CHUNK_SIZE) {
-        chunks.push(textsToTranslate.slice(i, i + CHUNK_SIZE));
-      }
-
+      console.log(`[Legenda] Traduzindo ${textsToTranslate.length} linhas com DeepL...`);
+      const CHUNK_SIZE = 200;
+      
       try {
-        const translatedChunks = await Promise.all(
-          chunks.map(chunk => 
-            translator.translateText(chunk, null, 'pt-PT')
-              .then(results => results.map(r => r.text))
-          )
-        );
-        translatedTexts = translatedChunks.flat();
+        for (let i = 0; i < textsToTranslate.length; i += CHUNK_SIZE) {
+          const chunk = textsToTranslate.slice(i, i + CHUNK_SIZE);
+          const results = await translator.translateText(chunk, null, 'pt-PT');
+          translatedTexts.push(...results.map(r => r.text));
+        }
       } catch (deeplErr) {
-        console.error('[Legenda] Erro no DeepL (usando original):', deeplErr.message);
-        translatedTexts = textsToTranslate; // Fallback para inglês caso haja quota excedida
+        console.error('[DeepL Error]:', deeplErr.message);
+        // Em caso de erro de quota/chave no DeepL, usa o texto original em inglês em vez de falhar
+        translatedTexts = textsToTranslate;
       }
     } else {
       translatedTexts = textsToTranslate;
     }
 
-    // D. Reconstrução e Formatação Estrita (\r\n) para ExoPlayer Android
+    // E. Reconstrução do SRT no formato exigido pelo Android
     const translatedObjects = parsedSrt.map((item, index) => ({
       ...item,
       text: translatedTexts[index] || item.text
@@ -142,12 +141,12 @@ app.get('/translate.srt', async (req, res) => {
     return res.status(200).send(finalSrt);
 
   } catch (error) {
-    console.error('[Legenda] Erro ao processar:', error?.message || error);
-    return res.status(200).send("1\r\n00:00:01,000 --> 00:00:05,000\r\nErro ao processar a legenda.\r\n\r\n");
+    console.error('[Geral Error]:', error?.message || error);
+    return res.status(200).send(`1\r\n00:00:01,000 --> 00:00:05,000\r\nErro do servidor: ${error?.message || 'Falha desconhecida'}\r\n\r\n`);
   }
 });
 
-// 5. Instanciar Router do SDK do Stremio
+// 5. Router do SDK do Stremio
 const addonInterface = builder.getInterface();
 app.use('/', getRouter(addonInterface));
 
