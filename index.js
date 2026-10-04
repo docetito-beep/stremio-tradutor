@@ -1,5 +1,5 @@
 const express = require('express');
-const { addonBuilder } = require('stremio-addon-sdk');
+const { addonBuilder, getRouter } = require('stremio-addon-sdk');
 const axios = require('axios');
 const Parser = require('srt-parser-2').default;
 const deepl = require('deepl-node');
@@ -7,7 +7,7 @@ const deepl = require('deepl-node');
 const app = express();
 const parser = new Parser();
 
-// Middleware para permitir que o Stremio aceda ao servidor sem erros de CORS / Failed to Fetch
+// 1. Configurar cabeçalhos CORS para o Stremio não ser bloqueado
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', '*');
@@ -19,7 +19,7 @@ const translator = process.env.DEEPL_API_KEY
   ? new deepl.Translator(process.env.DEEPL_API_KEY) 
   : null;
 
-// 1. Definição do Manifesto
+// 2. Definição do Manifesto do Stremio
 const manifest = {
   id: 'org.comunidade.tradutor.ptpt',
   version: '1.0.0',
@@ -33,10 +33,11 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
+// 3. Handler do Stremio para Legendas
 builder.defineSubtitlesHandler(async ({ type, id }) => {
   const host = process.env.PUBLIC_URL || 'http://localhost:7000';
   
-  return Promise.resolve({
+  return {
     subtitles: [
       {
         id: `ptpt_${id}`,
@@ -45,22 +46,14 @@ builder.defineSubtitlesHandler(async ({ type, id }) => {
         label: '🇵🇹 Português (Traduzido PT-PT)'
       }
     ]
-  });
+  };
 });
 
+// 4. Router oficial do Stremio SDK (Gere automaticamente /manifest.json e /subtitles/...)
 const addonInterface = builder.getInterface();
+app.use('/', getRouter(addonInterface));
 
-app.get('/manifest.json', (req, res) => {
-  res.json(addonInterface.manifest);
-});
-
-app.get('/subtitles/:type/:id/:extra?.json', (req, res) => {
-  addonInterface.get('subtitles', req.params.type, req.params.id, (err, resData) => {
-    if (err) return res.status(500).send(err);
-    res.json(resData);
-  });
-});
-
+// 5. Endpoint que faz a tradução e serve o ficheiro SRT
 app.get('/translate.srt', async (req, res) => {
   const mediaId = req.query.id;
   try {
