@@ -7,7 +7,10 @@ const deepl = require('deepl-node');
 const app = express();
 const parser = new Parser();
 
-// 1. Configurar cabeçalhos CORS globais para Stremio Web / Android Box
+// Cache em memória para armazenar até 100 legendas traduzidas
+const subtitleCache = new Map();
+const MAX_CACHE_SIZE = 100;
+
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', '*');
@@ -26,10 +29,9 @@ const http = axios.create({
   timeout: 12000
 });
 
-// 2. Definição do Manifesto do Stremio
 const manifest = {
   id: 'org.comunidade.tradutor.ptpt',
-  version: '1.0.0',
+  version: '1.1.0',
   name: 'Tradutor de Legendas (EN -> PT-PT)',
   description: 'Traduz automaticamente legendas de Inglês para Português de Portugal.',
   resources: ['subtitles'],
@@ -40,7 +42,6 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
-// 3. Subtitles Handler (envia o tipo e id para a rota de tradução)
 builder.defineSubtitlesHandler(async ({ type, id }) => {
   const host = process.env.PUBLIC_URL 
     ? process.env.PUBLIC_URL.replace(/\/$/, '') 
@@ -58,7 +59,6 @@ builder.defineSubtitlesHandler(async ({ type, id }) => {
   };
 });
 
-// 4. Endpoint do ficheiro SRT via OpenSubtitles v3 Oficial
 app.get('/translate.srt', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -72,67 +72,45 @@ app.get('/translate.srt', async (req, res) => {
     return res.status(200).send("1\r\n00:00:01,000 --> 00:00:05,000\r\nSem ID fornecido.\r\n\r\n");
   }
 
-  console.log(`[Legenda] Pedido recebido para ID: ${fullId} (tipo: ${type})`);
+  // 1. Verificação na Cache (Resposta Instantânea)
+  if (subtitleCache.has(fullId)) {
+    console.log(`[Cache Hit] Legenda entregue instantaneamente para: ${fullId}`);
+    return res.status(200).send(subtitleCache.get(fullId));
+  }
+
+  console.log(`[Legenda] Novo pedido de tradução para ID: ${fullId} (${type})`);
 
   try {
-    // A. Pesquisa de legenda no OpenSubtitles v3 do Stremio
-    let subSearch;
-    try {
-      subSearch = await http.get(`https://opensubtitles-v3.strem.io/subtitles/${type}/${fullId}.json`);
-    } catch (openSubErr) {
-      console.error('[OpenSubtitles Error]:', openSubErr.message);
-      return res.status(200).send(`1\r\n00:00:01,000 --> 00:00:05,000\r\nErro ao procurar legenda: ${openSubErr.message}\r\n\r\n`);
-    }
-
+    const subSearch = await http.get(`https://opensubtitles-v3.strem.io/subtitles/${type}/${fullId}.json`);
     const subList = subSearch.data?.subtitles;
+
     if (!Array.isArray(subList) || subList.length === 0) {
       return res.status(200).send("1\r\n00:00:01,000 --> 00:00:05,000\r\nNenhuma legenda em inglês encontrada.\r\n\r\n");
     }
 
-    // B. Selecionar legenda em inglês
     const enSub = subList.find(s => s.lang === 'eng' || s.lang === 'en') || subList[0];
-    if (!enSub || !enSub.url) {
-      return res.status(200).send("1\r\n00:00:01,000 --> 00:00:05,000\r\nLegenda em inglês não encontrada.\r\n\r\n");
-    }
-
-    console.log(`[Legenda] Descarregando SRT original do OpenSubtitles: ${enSub.url}`);
     const srtDownload = await http.get(enSub.url);
-    let rawSrt = srtDownload.data;
+    let rawSrt = typeof srtDownload.data === 'string' ? srtDownload.data : String(srtDownload.data);
 
-    if (typeof rawSrt !== 'string') {
-      rawSrt = String(rawSrt);
-    }
-
-    // C. Parser do SRT
     const parsedSrt = parser.fromSrt(rawSrt);
     if (!parsedSrt || parsedSrt.length === 0) {
-      const cleanRaw = rawSrt.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n');
-      return res.status(200).send(cleanRaw);
+      return res.status(200).send(rawSrt.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n'));
     }
 
     const textsToTranslate = parsedSrt.map(item => item.text);
     let translatedTexts = [];
 
-    // D. Tradução em lotes de 200 linhas via DeepL
     if (translator) {
-      console.log(`[Legenda] Traduzindo ${textsToTranslate.length} linhas com DeepL...`);
-      const CHUNK_SIZE = 200;
-      
-      try {
-        for (let i = 0; i < textsToTranslate.length; i += CHUNK_SIZE) {
-          const chunk = textsToTranslate.slice(i, i + CHUNK_SIZE);
-          const results = await translator.translateText(chunk, null, 'pt-PT');
-          translatedTexts.push(...results.map(r => r.text));
-        }
-      } catch (deeplErr) {
-        console.error('[DeepL Error]:', deeplErr.message);
-        translatedTexts = textsToTranslate; // Fallback para o texto original se o DeepL falhar
+      const CHUNK_SIZE = 250;
+      for (let i = 0; i < textsToTranslate.length; i += CHUNK_SIZE) {
+        const chunk = textsToTranslate.slice(i, i + CHUNK_SIZE);
+        const results = await translator.translateText(chunk, null, 'pt-PT');
+        translatedTexts.push(...results.map(r => r.text));
       }
     } else {
       translatedTexts = textsToTranslate;
     }
 
-    // E. Reconstrução no formato exigido pelo leitor Android ExoPlayer (\r\n)
     const translatedObjects = parsedSrt.map((item, index) => ({
       ...item,
       text: translatedTexts[index] || item.text
@@ -141,7 +119,14 @@ app.get('/translate.srt', async (req, res) => {
     let finalSrt = parser.toSrt(translatedObjects);
     finalSrt = finalSrt.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n');
 
-    console.log(`[Legenda] Legenda entregue com sucesso para: ${fullId}`);
+    // 2. Guardar na Cache para futuros pedidos
+    if (subtitleCache.size >= MAX_CACHE_SIZE) {
+      const firstKey = subtitleCache.keys().next().value;
+      subtitleCache.delete(firstKey);
+    }
+    subtitleCache.set(fullId, finalSrt);
+
+    console.log(`[Legenda] Concluída e guardada em cache para: ${fullId}`);
     return res.status(200).send(finalSrt);
 
   } catch (error) {
@@ -150,10 +135,8 @@ app.get('/translate.srt', async (req, res) => {
   }
 });
 
-// 5. Router do SDK do Stremio
 const addonInterface = builder.getInterface();
 app.use('/', getRouter(addonInterface));
 
-// 6. Arrancar servidor
 const PORT = process.env.PORT || 7000;
 app.listen(PORT, () => console.log(`Addon ativo na porta ${PORT}`));
