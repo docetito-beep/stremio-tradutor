@@ -7,7 +7,7 @@ const deepl = require('deepl-node');
 const app = express();
 const parser = new Parser();
 
-// 1. Configurar cabeçalhos CORS globais
+// 1. Configurar cabeçalhos CORS globais para Stremio Web / Android ExoPlayer
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', '*');
@@ -18,6 +18,14 @@ app.use((req, res, next) => {
 const translator = process.env.DEEPL_API_KEY 
   ? new deepl.Translator(process.env.DEEPL_API_KEY) 
   : null;
+
+// Configuração do Axios com User-Agent para evitar bloqueios 403
+const http = axios.create({
+  headers: {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  },
+  timeout: 10000
+});
 
 // 2. Definição do Manifesto do Stremio
 const manifest = {
@@ -33,7 +41,7 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
-// 3. Handler do Stremio com garantia de URL HTTPS pública
+// 3. Subtitles Handler
 builder.defineSubtitlesHandler(async ({ type, id }) => {
   const host = process.env.PUBLIC_URL 
     ? process.env.PUBLIC_URL.replace(/\/$/, '') 
@@ -43,7 +51,7 @@ builder.defineSubtitlesHandler(async ({ type, id }) => {
     subtitles: [
       {
         id: `ptpt_${id}`,
-        url: `${host}/translate.srt?id=${id}`,
+        url: `${host}/translate.srt?id=${encodeURIComponent(id)}`,
         lang: 'por',
         label: '🇵🇹 Português (Traduzido PT-PT)'
       }
@@ -51,60 +59,68 @@ builder.defineSubtitlesHandler(async ({ type, id }) => {
   };
 });
 
-// 4. Endpoint com tradução paralela e formato aceito no Android ExoPlayer
+// 4. Endpoint do ficheiro SRT
 app.get('/translate.srt', async (req, res) => {
+  // Configuração rigorosa dos cabeçalhos do player Android
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', '*');
-  res.setHeader('Content-Type', 'application/x-subrip; charset=utf-8');
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
 
-  const mediaId = req.query.id;
-  if (!mediaId) {
-    return res.status(400).send('ID do media não fornecido.');
+  const fullId = req.query.id;
+  if (!fullId) {
+    return res.status(200).send('1\n00:00:01,000 --> 00:00:05,000\nID não fornecido.\n\n');
   }
 
-  console.log(`[Legenda] Pedido recebido para ID: ${mediaId}`);
+  console.log(`[Legenda] Pedido recebido para ID: ${fullId}`);
 
   try {
-    // A. Procurar legenda em inglês
-    const subSearch = await axios.get(`https://sub.wyzie.ru/search?id=${mediaId}`);
+    // Tratar IDs de séries (ex: tt1234567:1:2 -> tt1234567)
+    const mediaId = fullId.split(':')[0];
+
+    // A. Procurar legenda na API Wyzie
+    const subSearch = await http.get(`https://sub.wyzie.ru/search?id=${mediaId}`);
     const subList = subSearch.data;
 
-    if (!subList || subList.length === 0) {
+    if (!Array.isArray(subList) || subList.length === 0) {
       console.log(`[Legenda] Nenhuma legenda encontrada para: ${mediaId}`);
-      return res.status(404).send('Legenda em inglês não encontrada.');
+      return res.status(200).send('1\n00:00:01,000 --> 00:00:05,000\nLegenda em inglês não encontrada.\n\n');
     }
 
+    // Selecionar legenda em inglês
     const enSub = subList.find(s => s.lang === 'en' || s.lang === 'eng') || subList[0];
-    const srtDownload = await axios.get(enSub.url);
+    const srtDownload = await http.get(enSub.url);
     const rawSrt = srtDownload.data;
 
-    // B. Parse da legenda
+    // B. Converter SRT para Objeto
     const parsedSrt = parser.fromSrt(rawSrt);
+    if (!parsedSrt || parsedSrt.length === 0) {
+      return res.status(200).send(rawSrt); // Entrega o SRT original caso o parse falhe
+    }
+
     const textsToTranslate = parsedSrt.map(item => item.text);
-
-    console.log(`[Legenda] A traduzir ${textsToTranslate.length} linhas em paralelo com DeepL...`);
-
-    // C. Tradução em PARALELO (Promise.all) em blocos de 100 linhas
     let translatedTexts = [];
-    if (translator) {
-      const CHUNK_SIZE = 100;
-      const chunks = [];
-      for (let i = 0; i < textsToTranslate.length; i += CHUNK_SIZE) {
-        chunks.push(textsToTranslate.slice(i, i + CHUNK_SIZE));
-      }
 
-      const translatedChunks = await Promise.all(
-        chunks.map(chunk =>
-          translator.translateText(chunk, null, 'pt-PT').then(r => r.map(item => item.text))
-        )
-      );
-      translatedTexts = translatedChunks.flat();
+    // C. Tradução via DeepL com Proteção de Erros
+    if (translator) {
+      try {
+        console.log(`[Legenda] Traduzindo ${textsToTranslate.length} linhas com DeepL...`);
+        const CHUNK_SIZE = 50;
+        
+        for (let i = 0; i < textsToTranslate.length; i += CHUNK_SIZE) {
+          const chunk = textsToTranslate.slice(i, i + CHUNK_SIZE);
+          const results = await translator.translateText(chunk, null, 'pt-PT');
+          translatedTexts.push(...results.map(r => r.text));
+        }
+      } catch (deeplError) {
+        console.error('[Legenda] Erro no DeepL (usando texto original):', deeplError.message);
+        translatedTexts = textsToTranslate; // Fallback para inglês se o DeepL falhar
+      }
     } else {
       translatedTexts = textsToTranslate;
     }
 
-    // D. Reconstrução do SRT
+    // D. Reconstruir SRT
     const translatedSrtObjects = parsedSrt.map((item, index) => ({
       ...item,
       text: translatedTexts[index] || item.text
@@ -112,19 +128,20 @@ app.get('/translate.srt', async (req, res) => {
 
     const finalSrt = parser.toSrt(translatedSrtObjects);
 
-    console.log(`[Legenda] Tradução concluída com sucesso para: ${mediaId}`);
+    console.log(`[Legenda] Legenda entregue com sucesso para: ${fullId}`);
     return res.status(200).send(finalSrt);
 
   } catch (error) {
-    console.error('[Legenda] Erro ao processar tradução:', error?.message || error);
-    return res.status(500).send('Erro ao processar a tradução da legenda.');
+    console.error('[Legenda] Erro geral ao processar:', error?.message || error);
+    // IMPORTANTE: Devolve HTTP 200 com mensagem explicativa em vez de 500 para não quebrar o Stremio
+    return res.status(200).send('1\n00:00:01,000 --> 00:00:05,000\nErro ao traduzir legenda. Verifique o servidor.\n\n');
   }
 });
 
-// 5. Router do Stremio SDK
+// 5. Instanciar Router do SDK do Stremio
 const addonInterface = builder.getInterface();
 app.use('/', getRouter(addonInterface));
 
-// 6. Arrancar o servidor
+// 6. Arrancar servidor
 const PORT = process.env.PORT || 7000;
 app.listen(PORT, () => console.log(`Addon ativo na porta ${PORT}`));
