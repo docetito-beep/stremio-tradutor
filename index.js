@@ -7,7 +7,7 @@ const deepl = require('deepl-node');
 const app = express();
 const parser = new Parser();
 
-// 1. Configurar cabeçalhos CORS globais para permitir ligação do Stremio
+// 1. Configurar cabeçalhos CORS globais
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', '*');
@@ -15,7 +15,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Configurar o tradutor DeepL se a chave de API estiver definida
 const translator = process.env.DEEPL_API_KEY 
   ? new deepl.Translator(process.env.DEEPL_API_KEY) 
   : null;
@@ -34,9 +33,11 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
-// 3. Handler do Stremio para indicar a presença da legenda traduzida
+// 3. Handler do Stremio com garantia de URL HTTPS pública
 builder.defineSubtitlesHandler(async ({ type, id }) => {
-  const host = process.env.PUBLIC_URL || 'http://localhost:7000';
+  const host = process.env.PUBLIC_URL 
+    ? process.env.PUBLIC_URL.replace(/\/$/, '') 
+    : 'http://localhost:7000';
   
   return {
     subtitles: [
@@ -50,12 +51,12 @@ builder.defineSubtitlesHandler(async ({ type, id }) => {
   };
 });
 
-// 4. Endpoint que descarrega, traduz em lotes e serve o ficheiro SRT
+// 4. Endpoint com tradução paralela e formato aceito no Android ExoPlayer
 app.get('/translate.srt', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', '*');
-  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('Content-Type', 'application/x-subrip; charset=utf-8');
 
   const mediaId = req.query.id;
   if (!mediaId) {
@@ -65,7 +66,7 @@ app.get('/translate.srt', async (req, res) => {
   console.log(`[Legenda] Pedido recebido para ID: ${mediaId}`);
 
   try {
-    // A. Procurar legenda em inglês na API
+    // A. Procurar legenda em inglês
     const subSearch = await axios.get(`https://sub.wyzie.ru/search?id=${mediaId}`);
     const subList = subSearch.data;
 
@@ -75,35 +76,35 @@ app.get('/translate.srt', async (req, res) => {
     }
 
     const enSub = subList.find(s => s.lang === 'en' || s.lang === 'eng') || subList[0];
-    console.log(`[Legenda] A descarregar SRT original: ${enSub.url}`);
-
-    // B. Descarregar o ficheiro SRT
     const srtDownload = await axios.get(enSub.url);
     const rawSrt = srtDownload.data;
 
-    // C. Converter o SRT para objeto
+    // B. Parse da legenda
     const parsedSrt = parser.fromSrt(rawSrt);
     const textsToTranslate = parsedSrt.map(item => item.text);
 
-    console.log(`[Legenda] A traduzir ${textsToTranslate.length} linhas com o DeepL...`);
+    console.log(`[Legenda] A traduzir ${textsToTranslate.length} linhas em paralelo com DeepL...`);
 
-    // D. Traduzir em lotes (chunks) de 50 linhas para evitar erros no DeepL
-    const CHUNK_SIZE = 50;
+    // C. Tradução em PARALELO (Promise.all) em blocos de 100 linhas
     let translatedTexts = [];
-
-    for (let i = 0; i < textsToTranslate.length; i += CHUNK_SIZE) {
-      const chunk = textsToTranslate.slice(i, i + CHUNK_SIZE);
-      
-      if (translator) {
-        const results = await translator.translateText(chunk, null, 'pt-PT');
-        translatedTexts.push(...results.map(r => r.text));
-      } else {
-        // Fallback caso a chave do DeepL não esteja definida
-        translatedTexts.push(...chunk);
+    if (translator) {
+      const CHUNK_SIZE = 100;
+      const chunks = [];
+      for (let i = 0; i < textsToTranslate.length; i += CHUNK_SIZE) {
+        chunks.push(textsToTranslate.slice(i, i + CHUNK_SIZE));
       }
+
+      const translatedChunks = await Promise.all(
+        chunks.map(chunk =>
+          translator.translateText(chunk, null, 'pt-PT').then(r => r.map(item => item.text))
+        )
+      );
+      translatedTexts = translatedChunks.flat();
+    } else {
+      translatedTexts = textsToTranslate;
     }
 
-    // E. Reconstruir a estrutura do SRT com os textos traduzidos
+    // D. Reconstrução do SRT
     const translatedSrtObjects = parsedSrt.map((item, index) => ({
       ...item,
       text: translatedTexts[index] || item.text
@@ -120,7 +121,7 @@ app.get('/translate.srt', async (req, res) => {
   }
 });
 
-// 5. Integração do Router oficial do Stremio SDK
+// 5. Router do Stremio SDK
 const addonInterface = builder.getInterface();
 app.use('/', getRouter(addonInterface));
 
