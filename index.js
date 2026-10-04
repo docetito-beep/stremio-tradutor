@@ -40,7 +40,7 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
-// 3. Subtitles Handler
+// 3. Subtitles Handler (envia o tipo e id para a rota de tradução)
 builder.defineSubtitlesHandler(async ({ type, id }) => {
   const host = process.env.PUBLIC_URL 
     ? process.env.PUBLIC_URL.replace(/\/$/, '') 
@@ -50,7 +50,7 @@ builder.defineSubtitlesHandler(async ({ type, id }) => {
     subtitles: [
       {
         id: `ptpt_${id}`,
-        url: `${host}/translate.srt?id=${encodeURIComponent(id)}`,
+        url: `${host}/translate.srt?type=${type}&id=${encodeURIComponent(id)}`,
         lang: 'por',
         label: '🇵🇹 Português (Traduzido PT-PT)'
       }
@@ -58,7 +58,7 @@ builder.defineSubtitlesHandler(async ({ type, id }) => {
   };
 });
 
-// 4. Endpoint do ficheiro SRT
+// 4. Endpoint do ficheiro SRT via OpenSubtitles v3 Oficial
 app.get('/translate.srt', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -66,31 +66,36 @@ app.get('/translate.srt', async (req, res) => {
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
 
   const fullId = req.query.id;
+  const type = req.query.type || (fullId && fullId.includes(':') ? 'series' : 'movie');
+
   if (!fullId) {
     return res.status(200).send("1\r\n00:00:01,000 --> 00:00:05,000\r\nSem ID fornecido.\r\n\r\n");
   }
 
-  console.log(`[Legenda] Pedido recebido para ID: ${fullId}`);
+  console.log(`[Legenda] Pedido recebido para ID: ${fullId} (tipo: ${type})`);
 
   try {
-    const mediaId = fullId.split(':')[0]; // Trata IDs de filmes e séries
-
-    // A. Pesquisa de legenda original
+    // A. Pesquisa de legenda no OpenSubtitles v3 do Stremio
     let subSearch;
     try {
-      subSearch = await http.get(`https://sub.wyzie.ru/search?id=${mediaId}`);
-    } catch (wyzieErr) {
-      console.error('[Wyzie Error]:', wyzieErr.message);
-      return res.status(200).send(`1\r\n00:00:01,000 --> 00:00:05,000\r\nErro ao procurar legenda no Wyzie: ${wyzieErr.message}\r\n\r\n`);
+      subSearch = await http.get(`https://opensubtitles-v3.strem.io/subtitles/${type}/${fullId}.json`);
+    } catch (openSubErr) {
+      console.error('[OpenSubtitles Error]:', openSubErr.message);
+      return res.status(200).send(`1\r\n00:00:01,000 --> 00:00:05,000\r\nErro ao procurar legenda: ${openSubErr.message}\r\n\r\n`);
     }
 
-    const subList = subSearch.data;
+    const subList = subSearch.data?.subtitles;
     if (!Array.isArray(subList) || subList.length === 0) {
       return res.status(200).send("1\r\n00:00:01,000 --> 00:00:05,000\r\nNenhuma legenda em inglês encontrada.\r\n\r\n");
     }
 
-    // B. Download do ficheiro SRT
-    const enSub = subList.find(s => s.lang === 'en' || s.lang === 'eng') || subList[0];
+    // B. Selecionar legenda em inglês
+    const enSub = subList.find(s => s.lang === 'eng' || s.lang === 'en') || subList[0];
+    if (!enSub || !enSub.url) {
+      return res.status(200).send("1\r\n00:00:01,000 --> 00:00:05,000\r\nLegenda em inglês não encontrada.\r\n\r\n");
+    }
+
+    console.log(`[Legenda] Descarregando SRT original do OpenSubtitles: ${enSub.url}`);
     const srtDownload = await http.get(enSub.url);
     let rawSrt = srtDownload.data;
 
@@ -108,7 +113,7 @@ app.get('/translate.srt', async (req, res) => {
     const textsToTranslate = parsedSrt.map(item => item.text);
     let translatedTexts = [];
 
-    // D. Tradução em lotes otimizados de 200 linhas (evita erro 429 do DeepL)
+    // D. Tradução em lotes de 200 linhas via DeepL
     if (translator) {
       console.log(`[Legenda] Traduzindo ${textsToTranslate.length} linhas com DeepL...`);
       const CHUNK_SIZE = 200;
@@ -121,14 +126,13 @@ app.get('/translate.srt', async (req, res) => {
         }
       } catch (deeplErr) {
         console.error('[DeepL Error]:', deeplErr.message);
-        // Em caso de erro de quota/chave no DeepL, usa o texto original em inglês em vez de falhar
-        translatedTexts = textsToTranslate;
+        translatedTexts = textsToTranslate; // Fallback para o texto original se o DeepL falhar
       }
     } else {
       translatedTexts = textsToTranslate;
     }
 
-    // E. Reconstrução do SRT no formato exigido pelo Android
+    // E. Reconstrução no formato exigido pelo leitor Android ExoPlayer (\r\n)
     const translatedObjects = parsedSrt.map((item, index) => ({
       ...item,
       text: translatedTexts[index] || item.text
