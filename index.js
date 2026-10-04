@@ -7,11 +7,19 @@ const deepl = require('deepl-node');
 const app = express();
 const parser = new Parser();
 
+// Middleware para permitir que o Stremio aceda ao servidor sem erros de CORS / Failed to Fetch
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  next();
+});
+
 const translator = process.env.DEEPL_API_KEY 
   ? new deepl.Translator(process.env.DEEPL_API_KEY) 
   : null;
 
-// 1. Definição do Manifesto do Stremio (com 'catalogs: []' incluído)
+// 1. Definição do Manifesto
 const manifest = {
   id: 'org.comunidade.tradutor.ptpt',
   version: '1.0.0',
@@ -19,7 +27,7 @@ const manifest = {
   description: 'Traduz automaticamente legendas de Inglês para Português de Portugal.',
   resources: ['subtitles'],
   types: ['movie', 'series'],
-  catalogs: [], // Campo obrigatório no Stremio SDK
+  catalogs: [],
   idPrefixes: ['tt']
 };
 
@@ -41,7 +49,11 @@ builder.defineSubtitlesHandler(async ({ type, id }) => {
 });
 
 const addonInterface = builder.getInterface();
-app.get('/manifest.json', (req, res) => res.json(addonInterface.manifest));
+
+app.get('/manifest.json', (req, res) => {
+  res.json(addonInterface.manifest);
+});
+
 app.get('/subtitles/:type/:id/:extra?.json', (req, res) => {
   addonInterface.get('subtitles', req.params.type, req.params.id, (err, resData) => {
     if (err) return res.status(500).send(err);
