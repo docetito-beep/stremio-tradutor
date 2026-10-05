@@ -7,7 +7,7 @@ const deepl = require('deepl-node');
 const app = express();
 const parser = new Parser();
 
-// Cache em memória
+// Cache em memória (guarda até 100 legendas prontas)
 const subtitleCache = new Map();
 const MAX_CACHE_SIZE = 100;
 
@@ -26,94 +26,71 @@ const http = axios.create({
   headers: {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'
   },
-  timeout: 12000
+  timeout: 8000
 });
 
-// Tradução de reserva via Google Translate (Lotes sequenciais seguros)
-async function translateWithGoogle(texts) {
-  console.log(`[Fallback Google] Traduzindo ${texts.length} linhas em lotes otimizados...`);
-  const results = [];
-  const CHUNK_SIZE = 40;
-
+// Tradução ultra-rápida via Google Translate (Lotes paralelos com separador seguro |~|)
+async function translateWithGoogleFast(texts) {
+  console.log(`[Google Fast] Traduzindo ${texts.length} linhas em alta velocidade...`);
+  const CHUNK_SIZE = 40; // 40 frases por pedido (~1.500 caracteres)
+  const DELIMITER = ' |~| ';
+  
+  // Dividir o texto em lotes
+  const chunks = [];
   for (let i = 0; i < texts.length; i += CHUNK_SIZE) {
-    const chunk = texts.slice(i, i + CHUNK_SIZE);
+    chunks.push(texts.slice(i, i + CHUNK_SIZE));
+  }
+
+  // Processar até 4 lotes em paralelo para máximo desempenho
+  const PARALLEL_LIMIT = 4;
+  const results = [];
+
+  for (let i = 0; i < chunks.length; i += PARALLEL_LIMIT) {
+    const currentChunks = chunks.slice(i, i + PARALLEL_LIMIT);
     
-    // Preserva quebras de linha internas convertendo para <br>
-    const sanitizedChunk = chunk.map(t => (t || '').replace(/\n/g, ' <br> '));
-    const payload = sanitizedChunk.join('\n');
+    const chunkPromises = currentChunks.map(async (chunk) => {
+      const cleanChunk = chunk.map(t => (t || '').replace(/\r?\n/g, '<br>'));
+      const payload = cleanChunk.join(DELIMITER);
 
-    try {
-      const response = await http.get('https://translate.googleapis.com/translate_a/single', {
-        params: {
-          client: 'gtx',
-          sl: 'en',
-          tl: 'pt',
-          dt: 't',
-          q: payload
-        },
-        timeout: 6000
-      });
+      try {
+        const response = await http.get('https://translate.googleapis.com/translate_a/single', {
+          params: {
+            client: 'gtx',
+            sl: 'en',
+            tl: 'pt',
+            dt: 't',
+            q: payload
+          },
+          timeout: 5000
+        });
 
-      if (response.data && response.data[0]) {
-        const translatedFull = response.data[0].map(item => item[0]).join('');
-        const splitLines = translatedFull.split('\n');
-
-        if (splitLines.length === chunk.length) {
-          const restored = splitLines.map(line => 
-            line.replace(/<\s*br\s*\/?>/gi, '\n').trim()
+        if (response.data && response.data[0]) {
+          const translatedFull = response.data[0].map(item => item[0]).join('');
+          const splitItems = translatedFull.split('|~|').map(s => 
+            s.replace(/<\s*br\s*\/?>/gi, '\n').trim()
           );
-          results.push(...restored);
-        } else {
-          const fallbackBatch = await translateBatchIndividual(chunk);
-          results.push(...fallbackBatch);
-        }
-      } else {
-        results.push(...chunk);
-      }
-    } catch (err) {
-      console.error(`[Google Chunk Error]:`, err.message);
-      const fallbackBatch = await translateBatchIndividual(chunk);
-      results.push(...fallbackBatch);
-    }
 
-    // Pausa preventiva de 100ms para evitar bloqueios do Google
-    await new Promise(resolve => setTimeout(resolve, 100));
+          if (splitItems.length === chunk.length) {
+            return splitItems;
+          }
+        }
+        return chunk;
+      } catch (err) {
+        console.error(`[Google Chunk Error]:`, err.message);
+        return chunk;
+      }
+    });
+
+    const batchResults = await Promise.all(chunkPromises);
+    batchResults.forEach(res => results.push(...res));
   }
 
   return results;
 }
 
-// Auxiliar para traduzir linha a linha caso um lote específico falhe
-async function translateBatchIndividual(chunk) {
-  const batchResults = [];
-  for (const text of chunk) {
-    if (!text || !text.trim()) {
-      batchResults.push(text);
-      continue;
-    }
-    try {
-      const sanitized = text.replace(/\n/g, ' <br> ');
-      const response = await http.get('https://translate.googleapis.com/translate_a/single', {
-        params: { client: 'gtx', sl: 'en', tl: 'pt', dt: 't', q: sanitized },
-        timeout: 3000
-      });
-      if (response.data && response.data[0]) {
-        const full = response.data[0].map(item => item[0]).join('');
-        batchResults.push(full.replace(/<\s*br\s*\/?>/gi, '\n').trim());
-      } else {
-        batchResults.push(text);
-      }
-    } catch (e) {
-      batchResults.push(text);
-    }
-    await new Promise(r => setTimeout(r, 60));
-  }
-  return batchResults;
-}
-
 const manifest = {
   id: 'org.comunidade.tradutor.ptpt',
-  version: '1.4.0',
+  version: '1.5.0',
   name: 'Tradutor de Legendas (EN -> PT-PT)',
   description: 'Traduz automaticamente legendas de Inglês para Português de Portugal.',
   resources: ['subtitles'],
@@ -192,10 +169,10 @@ app.get('/translate.srt', async (req, res) => {
         }
       } catch (deeplErr) {
         console.warn('[DeepL Quota/Erro]:', deeplErr.message);
-        translatedTexts = await translateWithGoogle(textsToTranslate);
+        translatedTexts = await translateWithGoogleFast(textsToTranslate);
       }
     } else {
-      translatedTexts = await translateWithGoogle(textsToTranslate);
+      translatedTexts = await translateWithGoogleFast(textsToTranslate);
     }
 
     const translatedObjects = parsedSrt.map((item, index) => ({
@@ -212,7 +189,7 @@ app.get('/translate.srt', async (req, res) => {
     }
     subtitleCache.set(fullId, finalSrt);
 
-    console.log(`[Legenda] Concluída com sucesso para: ${fullId}`);
+    console.log(`[Legenda] Concluída com sucesso em tempo recorde para: ${fullId}`);
     return res.status(200).send(finalSrt);
 
   } catch (error) {
