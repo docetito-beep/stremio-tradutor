@@ -7,6 +7,7 @@ const deepl = require('deepl-node');
 const app = express();
 const parser = new Parser();
 
+// Cache em memória
 const subtitleCache = new Map();
 const MAX_CACHE_SIZE = 100;
 
@@ -28,47 +29,91 @@ const http = axios.create({
   timeout: 12000
 });
 
-// Tradução de reserva via Google Translate (Linha a linha em lotes paralelos - Sem fusão de texto)
+// Tradução de reserva via Google Translate (Lotes sequenciais seguros)
 async function translateWithGoogle(texts) {
-  console.log(`[Fallback Google] Traduzindo ${texts.length} linhas de forma individual...`);
+  console.log(`[Fallback Google] Traduzindo ${texts.length} linhas em lotes otimizados...`);
   const results = [];
-  const CONCURRENCY = 25; // Processa 25 frases em paralelo por lote
+  const CHUNK_SIZE = 40;
 
-  for (let i = 0; i < texts.length; i += CONCURRENCY) {
-    const batch = texts.slice(i, i + CONCURRENCY);
-    const batchPromises = batch.map(async (text) => {
-      if (!text || !text.trim()) return text;
-      try {
-        const response = await http.get('https://translate.googleapis.com/translate_a/single', {
-          params: {
-            client: 'gtx',
-            sl: 'en',
-            tl: 'pt',
-            dt: 't',
-            q: text
-          },
-          timeout: 4000
-        });
+  for (let i = 0; i < texts.length; i += CHUNK_SIZE) {
+    const chunk = texts.slice(i, i + CHUNK_SIZE);
+    
+    // Preserva quebras de linha internas convertendo para <br>
+    const sanitizedChunk = chunk.map(t => (t || '').replace(/\n/g, ' <br> '));
+    const payload = sanitizedChunk.join('\n');
 
-        if (response.data && response.data[0]) {
-          return response.data[0].map(item => item[0]).join('');
+    try {
+      const response = await http.get('https://translate.googleapis.com/translate_a/single', {
+        params: {
+          client: 'gtx',
+          sl: 'en',
+          tl: 'pt',
+          dt: 't',
+          q: payload
+        },
+        timeout: 6000
+      });
+
+      if (response.data && response.data[0]) {
+        const translatedFull = response.data[0].map(item => item[0]).join('');
+        const splitLines = translatedFull.split('\n');
+
+        if (splitLines.length === chunk.length) {
+          const restored = splitLines.map(line => 
+            line.replace(/<\s*br\s*\/?>/gi, '\n').trim()
+          );
+          results.push(...restored);
+        } else {
+          const fallbackBatch = await translateBatchIndividual(chunk);
+          results.push(...fallbackBatch);
         }
-        return text;
-      } catch (err) {
-        return text; // Mantém o texto original se a linha individual falhar
+      } else {
+        results.push(...chunk);
       }
-    });
+    } catch (err) {
+      console.error(`[Google Chunk Error]:`, err.message);
+      const fallbackBatch = await translateBatchIndividual(chunk);
+      results.push(...fallbackBatch);
+    }
 
-    const batchResults = await Promise.all(batchPromises);
-    results.push(...batchResults);
+    // Pausa preventiva de 100ms para evitar bloqueios do Google
+    await new Promise(resolve => setTimeout(resolve, 100));
   }
 
   return results;
 }
 
+// Auxiliar para traduzir linha a linha caso um lote específico falhe
+async function translateBatchIndividual(chunk) {
+  const batchResults = [];
+  for (const text of chunk) {
+    if (!text || !text.trim()) {
+      batchResults.push(text);
+      continue;
+    }
+    try {
+      const sanitized = text.replace(/\n/g, ' <br> ');
+      const response = await http.get('https://translate.googleapis.com/translate_a/single', {
+        params: { client: 'gtx', sl: 'en', tl: 'pt', dt: 't', q: sanitized },
+        timeout: 3000
+      });
+      if (response.data && response.data[0]) {
+        const full = response.data[0].map(item => item[0]).join('');
+        batchResults.push(full.replace(/<\s*br\s*\/?>/gi, '\n').trim());
+      } else {
+        batchResults.push(text);
+      }
+    } catch (e) {
+      batchResults.push(text);
+    }
+    await new Promise(r => setTimeout(r, 60));
+  }
+  return batchResults;
+}
+
 const manifest = {
   id: 'org.comunidade.tradutor.ptpt',
-  version: '1.3.0',
+  version: '1.4.0',
   name: 'Tradutor de Legendas (EN -> PT-PT)',
   description: 'Traduz automaticamente legendas de Inglês para Português de Portugal.',
   resources: ['subtitles'],
@@ -136,7 +181,6 @@ app.get('/translate.srt', async (req, res) => {
     const textsToTranslate = parsedSrt.map(item => item.text);
     let translatedTexts = [];
 
-    // Tentar DeepL primeiro; se a quota tiver acabado, usa o Google Translate otimizado
     if (translator) {
       try {
         console.log(`[DeepL] Traduzindo ${textsToTranslate.length} linhas...`);
