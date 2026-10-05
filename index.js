@@ -7,7 +7,7 @@ const deepl = require('deepl-node');
 const app = express();
 const parser = new Parser();
 
-// Cache em memória (guarda até 100 legendas prontas)
+// Cache em memória
 const subtitleCache = new Map();
 const MAX_CACHE_SIZE = 100;
 
@@ -26,63 +26,57 @@ const http = axios.create({
   headers: {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'
   },
-  timeout: 8000
+  timeout: 10000
 });
 
-// Tradução ultra-rápida via Google Translate (Lotes paralelos com separador seguro |~|)
+// Tradução de reserva via Google Translate (POST em lotes - sem limite de URL)
 async function translateWithGoogleFast(texts) {
-  console.log(`[Google Fast] Traduzindo ${texts.length} linhas em alta velocidade...`);
-  const CHUNK_SIZE = 40; // 40 frases por pedido (~1.500 caracteres)
-  const DELIMITER = ' |~| ';
-  
-  // Dividir o texto em lotes
-  const chunks = [];
-  for (let i = 0; i < texts.length; i += CHUNK_SIZE) {
-    chunks.push(texts.slice(i, i + CHUNK_SIZE));
-  }
-
-  // Processar até 4 lotes em paralelo para máximo desempenho
-  const PARALLEL_LIMIT = 4;
+  console.log(`[Google POST] Traduzindo ${texts.length} linhas em lotes otimizados...`);
+  const CHUNK_SIZE = 30;
   const results = [];
 
-  for (let i = 0; i < chunks.length; i += PARALLEL_LIMIT) {
-    const currentChunks = chunks.slice(i, i + PARALLEL_LIMIT);
+  for (let i = 0; i < texts.length; i += CHUNK_SIZE) {
+    const chunk = texts.slice(i, i + CHUNK_SIZE);
     
-    const chunkPromises = currentChunks.map(async (chunk) => {
-      const cleanChunk = chunk.map(t => (t || '').replace(/\r?\n/g, '<br>'));
-      const payload = cleanChunk.join(DELIMITER);
+    // Substitui quebras internas por [br] para manter a integridade das frases
+    const sanitizedChunk = chunk.map(t => (t || '').replace(/\r?\n/g, ' [br] '));
+    const payload = sanitizedChunk.join('\n');
 
-      try {
-        const response = await http.get('https://translate.googleapis.com/translate_a/single', {
-          params: {
-            client: 'gtx',
-            sl: 'en',
-            tl: 'pt',
-            dt: 't',
-            q: payload
-          },
-          timeout: 5000
-        });
+    try {
+      const params = new URLSearchParams();
+      params.append('client', 'gtx');
+      params.append('sl', 'en');
+      params.append('tl', 'pt');
+      params.append('dt', 't');
+      params.append('q', payload);
 
-        if (response.data && response.data[0]) {
-          const translatedFull = response.data[0].map(item => item[0]).join('');
-          const splitItems = translatedFull.split('|~|').map(s => 
-            s.replace(/<\s*br\s*\/?>/gi, '\n').trim()
+      const response = await http.post('https://translate.googleapis.com/translate_a/single', params, {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        timeout: 6000
+      });
+
+      if (response.data && response.data[0]) {
+        const translatedFull = response.data[0].map(item => item[0]).join('');
+        const splitLines = translatedFull.split('\n');
+
+        if (splitLines.length === chunk.length) {
+          const restored = splitLines.map(line => 
+            line.replace(/\[\s*br\s*\]/gi, '\n').trim()
           );
-
-          if (splitItems.length === chunk.length) {
-            return splitItems;
-          }
+          results.push(...restored);
+        } else {
+          results.push(...chunk);
         }
-        return chunk;
-      } catch (err) {
-        console.error(`[Google Chunk Error]:`, err.message);
-        return chunk;
+      } else {
+        results.push(...chunk);
       }
-    });
+    } catch (err) {
+      console.error(`[Google POST Error]:`, err?.message || err);
+      results.push(...chunk);
+    }
 
-    const batchResults = await Promise.all(chunkPromises);
-    batchResults.forEach(res => results.push(...res));
+    // Pausa suave de 80ms entre lotes
+    await new Promise(resolve => setTimeout(resolve, 80));
   }
 
   return results;
@@ -90,7 +84,7 @@ async function translateWithGoogleFast(texts) {
 
 const manifest = {
   id: 'org.comunidade.tradutor.ptpt',
-  version: '1.5.0',
+  version: '1.6.0',
   name: 'Tradutor de Legendas (EN -> PT-PT)',
   description: 'Traduz automaticamente legendas de Inglês para Português de Portugal.',
   resources: ['subtitles'],
@@ -189,7 +183,7 @@ app.get('/translate.srt', async (req, res) => {
     }
     subtitleCache.set(fullId, finalSrt);
 
-    console.log(`[Legenda] Concluída com sucesso em tempo recorde para: ${fullId}`);
+    console.log(`[Legenda] Concluída com sucesso para: ${fullId}`);
     return res.status(200).send(finalSrt);
 
   } catch (error) {
