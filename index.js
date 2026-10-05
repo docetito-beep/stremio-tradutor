@@ -24,31 +24,25 @@ const translator = process.env.DEEPL_API_KEY
 
 const http = axios.create({
   headers: {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36'
   },
   timeout: 8000
 });
 
-// Tradução ultra-rápida via Google Translate (Lotes em paralelo sem timeouts)
+// Tradução via Google Translate Sequencial (Proteção total contra erro 429)
 async function translateWithGoogleFast(texts) {
-  console.log(`[Google Fast] Traduzindo ${texts.length} linhas em alta velocidade...`);
-  const CHUNK_SIZE = 50;
-  const chunks = [];
-  
+  console.log(`[Google Fallback] Traduzindo ${texts.length} linhas sequencialmente...`);
+  const CHUNK_SIZE = 70; // Lotes maiores = menos pedidos ao Google
+  const results = [];
+
   for (let i = 0; i < texts.length; i += CHUNK_SIZE) {
-    chunks.push(texts.slice(i, i + CHUNK_SIZE));
-  }
+    const chunk = texts.slice(i, i + CHUNK_SIZE);
+    const joinedText = chunk.map(t => (t || '').replace(/\r?\n/g, ' ')).join('\n');
 
-  const results = new Array(texts.length);
-  const CONCURRENCY = 5;
+    let success = false;
+    let retries = 2;
 
-  for (let i = 0; i < chunks.length; i += CONCURRENCY) {
-    const currentBatch = chunks.slice(i, i + CONCURRENCY);
-    
-    await Promise.all(currentBatch.map(async (chunk, batchIdx) => {
-      const globalOffset = (i + batchIdx) * CHUNK_SIZE;
-      const joinedText = chunk.map(t => (t || '').replace(/\r?\n/g, ' ')).join('\n');
-
+    while (retries > 0 && !success) {
       try {
         const params = new URLSearchParams();
         params.append('client', 'gtx');
@@ -58,8 +52,11 @@ async function translateWithGoogleFast(texts) {
         params.append('q', joinedText);
 
         const response = await http.post('https://translate.googleapis.com/translate_a/single', params.toString(), {
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
-          timeout: 4000
+          headers: { 
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36'
+          },
+          timeout: 5000
         });
 
         if (response.data && response.data[0]) {
@@ -67,16 +64,26 @@ async function translateWithGoogleFast(texts) {
           const lines = fullTranslated.split('\n');
 
           chunk.forEach((orig, idx) => {
-            results[globalOffset + idx] = lines[idx] ? lines[idx].trim() : orig;
+            results.push(lines[idx] ? lines[idx].trim() : orig);
           });
-        } else {
-          chunk.forEach((orig, idx) => { results[globalOffset + idx] = orig; });
+          success = true;
         }
       } catch (err) {
-        console.error(`[Google Chunk Error]:`, err?.message);
-        chunk.forEach((orig, idx) => { results[globalOffset + idx] = orig; });
+        console.warn(`[Google Chunk Error]: ${err?.message} (Tentativas restantes: ${retries - 1})`);
+        retries--;
+        if (retries > 0) {
+          // Pausa de 1 segundo se der erro antes de tentar novamente
+          await new Promise(res => setTimeout(res, 1000));
+        }
       }
-    }));
+    }
+
+    if (!success) {
+      results.push(...chunk);
+    }
+
+    // Pausa preventiva de 150ms entre cada lote para evitar o erro 429
+    await new Promise(res => setTimeout(res, 150));
   }
 
   return results;
@@ -84,7 +91,7 @@ async function translateWithGoogleFast(texts) {
 
 const manifest = {
   id: 'org.comunidade.tradutor.ptpt',
-  version: '1.8.0',
+  version: '1.9.0',
   name: 'Tradutor de Legendas (EN -> PT-PT)',
   description: 'Traduz automaticamente legendas de Inglês para Português de Portugal.',
   resources: ['subtitles'],
