@@ -7,7 +7,7 @@ const deepl = require('deepl-node');
 const app = express();
 const parser = new Parser();
 
-// Cache em memória
+// Cache em memória para entregas instantâneas
 const subtitleCache = new Map();
 const MAX_CACHE_SIZE = 100;
 
@@ -29,54 +29,85 @@ const http = axios.create({
   timeout: 10000
 });
 
-// Tradução de reserva via Google Translate (POST em lotes - sem limite de URL)
+// Tradução infalível via Google Translate (Envio multi-q com correspondência 1:1)
 async function translateWithGoogleFast(texts) {
-  console.log(`[Google POST] Traduzindo ${texts.length} linhas em lotes otimizados...`);
-  const CHUNK_SIZE = 30;
+  console.log(`[Google POST Multi-Q] Traduzindo ${texts.length} linhas...`);
+  const CHUNK_SIZE = 25;
   const results = [];
 
   for (let i = 0; i < texts.length; i += CHUNK_SIZE) {
     const chunk = texts.slice(i, i + CHUNK_SIZE);
     
-    // Substitui quebras internas por [br] para manter a integridade das frases
-    const sanitizedChunk = chunk.map(t => (t || '').replace(/\r?\n/g, ' [br] '));
-    const payload = sanitizedChunk.join('\n');
-
     try {
       const params = new URLSearchParams();
       params.append('client', 'gtx');
       params.append('sl', 'en');
       params.append('tl', 'pt');
       params.append('dt', 't');
-      params.append('q', payload);
+      
+      chunk.forEach(text => {
+        const cleanText = text ? text.replace(/\r?\n/g, ' ') : '';
+        params.append('q', cleanText.trim() ? cleanText : ' ');
+      });
 
       const response = await http.post('https://translate.googleapis.com/translate_a/single', params, {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
         timeout: 6000
       });
 
-      if (response.data && response.data[0]) {
-        const translatedFull = response.data[0].map(item => item[0]).join('');
-        const splitLines = translatedFull.split('\n');
-
-        if (splitLines.length === chunk.length) {
-          const restored = splitLines.map(line => 
-            line.replace(/\[\s*br\s*\]/gi, '\n').trim()
-          );
-          results.push(...restored);
-        } else {
-          results.push(...chunk);
-        }
+      if (response.data && Array.isArray(response.data)) {
+        const data = response.data;
+        chunk.forEach((originalText, idx) => {
+          try {
+            const item = data[idx];
+            if (item && item[0]) {
+              const translated = item[0].map(s => s[0]).join('');
+              results.push(translated || originalText);
+            } else {
+              results.push(originalText);
+            }
+          } catch (e) {
+            results.push(originalText);
+          }
+        });
       } else {
         results.push(...chunk);
       }
     } catch (err) {
-      console.error(`[Google POST Error]:`, err?.message || err);
-      results.push(...chunk);
+      console.error(`[Google POST Batch Error]:`, err?.message || err);
+      
+      // Resgate linha a linha se o lote falhar
+      for (const line of chunk) {
+        if (!line || !line.trim()) {
+          results.push(line);
+          continue;
+        }
+        try {
+          const p = new URLSearchParams();
+          p.append('client', 'gtx');
+          p.append('sl', 'en');
+          p.append('tl', 'pt');
+          p.append('dt', 't');
+          p.append('q', line.replace(/\r?\n/g, ' '));
+          
+          const res = await http.post('https://translate.googleapis.com/translate_a/single', p, {
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+            timeout: 2500
+          });
+          
+          if (res.data && res.data[0]) {
+            const trans = res.data[0].map(s => s[0]).join('');
+            results.push(trans || line);
+          } else {
+            results.push(line);
+          }
+        } catch (e) {
+          results.push(line);
+        }
+      }
     }
 
-    // Pausa suave de 80ms entre lotes
-    await new Promise(resolve => setTimeout(resolve, 80));
+    await new Promise(resolve => setTimeout(resolve, 50));
   }
 
   return results;
@@ -84,7 +115,7 @@ async function translateWithGoogleFast(texts) {
 
 const manifest = {
   id: 'org.comunidade.tradutor.ptpt',
-  version: '1.6.0',
+  version: '1.7.0',
   name: 'Tradutor de Legendas (EN -> PT-PT)',
   description: 'Traduz automaticamente legendas de Inglês para Português de Portugal.',
   resources: ['subtitles'],
