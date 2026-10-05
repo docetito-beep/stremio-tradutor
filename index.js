@@ -7,7 +7,6 @@ const deepl = require('deepl-node');
 const app = express();
 const parser = new Parser();
 
-// Cache em memória para armazenar até 100 legendas traduzidas
 const subtitleCache = new Map();
 const MAX_CACHE_SIZE = 100;
 
@@ -29,9 +28,46 @@ const http = axios.create({
   timeout: 12000
 });
 
+// Função de tradução de reserva via Google Translate (Gratuito / Sem limite)
+async function translateWithGoogle(texts) {
+  console.log(`[Fallback] Traduzindo ${texts.length} linhas via Google Translate...`);
+  const CHUNK_SIZE = 50;
+  const results = [];
+
+  for (let i = 0; i < texts.length; i += CHUNK_SIZE) {
+    const chunk = texts.slice(i, i + CHUNK_SIZE);
+    const textToTranslate = chunk.join('\n---LINE---\n');
+
+    try {
+      const response = await http.get('https://translate.googleapis.com/translate_a/single', {
+        params: {
+          client: 'gtx',
+          sl: 'en',
+          tl: 'pt',
+          dt: 't',
+          q: textToTranslate
+        }
+      });
+
+      if (response.data && response.data[0]) {
+        const translatedFull = response.data[0].map(item => item[0]).join('');
+        const splitLines = translatedFull.split(/\n\s*---LINE---\s*\n|\n---LINE---|---LINE---\n/);
+        results.push(...splitLines.map(l => l.trim()));
+      } else {
+        results.push(...chunk);
+      }
+    } catch (err) {
+      console.error('[Google Fallback Error]:', err.message);
+      results.push(...chunk);
+    }
+  }
+
+  return results;
+}
+
 const manifest = {
   id: 'org.comunidade.tradutor.ptpt',
-  version: '1.1.0',
+  version: '1.2.0',
   name: 'Tradutor de Legendas (EN -> PT-PT)',
   description: 'Traduz automaticamente legendas de Inglês para Português de Portugal.',
   resources: ['subtitles'],
@@ -72,13 +108,12 @@ app.get('/translate.srt', async (req, res) => {
     return res.status(200).send("1\r\n00:00:01,000 --> 00:00:05,000\r\nSem ID fornecido.\r\n\r\n");
   }
 
-  // 1. Verificação na Cache (Resposta Instantânea)
   if (subtitleCache.has(fullId)) {
-    console.log(`[Cache Hit] Legenda entregue instantaneamente para: ${fullId}`);
+    console.log(`[Cache Hit] Legenda entregue para: ${fullId}`);
     return res.status(200).send(subtitleCache.get(fullId));
   }
 
-  console.log(`[Legenda] Novo pedido de tradução para ID: ${fullId} (${type})`);
+  console.log(`[Legenda] Pedido de tradução para ID: ${fullId} (${type})`);
 
   try {
     const subSearch = await http.get(`https://opensubtitles-v3.strem.io/subtitles/${type}/${fullId}.json`);
@@ -100,15 +135,23 @@ app.get('/translate.srt', async (req, res) => {
     const textsToTranslate = parsedSrt.map(item => item.text);
     let translatedTexts = [];
 
+    // Tentar traduzir com DeepL
     if (translator) {
-      const CHUNK_SIZE = 250;
-      for (let i = 0; i < textsToTranslate.length; i += CHUNK_SIZE) {
-        const chunk = textsToTranslate.slice(i, i + CHUNK_SIZE);
-        const results = await translator.translateText(chunk, null, 'pt-PT');
-        translatedTexts.push(...results.map(r => r.text));
+      try {
+        console.log(`[DeepL] Traduzindo ${textsToTranslate.length} linhas...`);
+        const CHUNK_SIZE = 250;
+        for (let i = 0; i < textsToTranslate.length; i += CHUNK_SIZE) {
+          const chunk = textsToTranslate.slice(i, i + CHUNK_SIZE);
+          const results = await translator.translateText(chunk, null, 'pt-PT');
+          translatedTexts.push(...results.map(r => r.text));
+        }
+      } catch (deeplErr) {
+        console.warn('[DeepL Indisponível/Quota Excedida]:', deeplErr.message);
+        // Em caso de quota excedida ou erro no DeepL, usa o Google Translate
+        translatedTexts = await translateWithGoogle(textsToTranslate);
       }
     } else {
-      translatedTexts = textsToTranslate;
+      translatedTexts = await translateWithGoogle(textsToTranslate);
     }
 
     const translatedObjects = parsedSrt.map((item, index) => ({
@@ -119,14 +162,13 @@ app.get('/translate.srt', async (req, res) => {
     let finalSrt = parser.toSrt(translatedObjects);
     finalSrt = finalSrt.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n');
 
-    // 2. Guardar na Cache para futuros pedidos
     if (subtitleCache.size >= MAX_CACHE_SIZE) {
       const firstKey = subtitleCache.keys().next().value;
       subtitleCache.delete(firstKey);
     }
     subtitleCache.set(fullId, finalSrt);
 
-    console.log(`[Legenda] Concluída e guardada em cache para: ${fullId}`);
+    console.log(`[Legenda] Concluída com sucesso para: ${fullId}`);
     return res.status(200).send(finalSrt);
 
   } catch (error) {
