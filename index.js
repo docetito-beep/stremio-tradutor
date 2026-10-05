@@ -26,88 +26,57 @@ const http = axios.create({
   headers: {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'
   },
-  timeout: 10000
+  timeout: 8000
 });
 
-// Tradução infalível via Google Translate (Envio multi-q com correspondência 1:1)
+// Tradução ultra-rápida via Google Translate (Lotes em paralelo sem timeouts)
 async function translateWithGoogleFast(texts) {
-  console.log(`[Google POST Multi-Q] Traduzindo ${texts.length} linhas...`);
-  const CHUNK_SIZE = 25;
-  const results = [];
-
+  console.log(`[Google Fast] Traduzindo ${texts.length} linhas em alta velocidade...`);
+  const CHUNK_SIZE = 50;
+  const chunks = [];
+  
   for (let i = 0; i < texts.length; i += CHUNK_SIZE) {
-    const chunk = texts.slice(i, i + CHUNK_SIZE);
+    chunks.push(texts.slice(i, i + CHUNK_SIZE));
+  }
+
+  const results = new Array(texts.length);
+  const CONCURRENCY = 5;
+
+  for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+    const currentBatch = chunks.slice(i, i + CONCURRENCY);
     
-    try {
-      const params = new URLSearchParams();
-      params.append('client', 'gtx');
-      params.append('sl', 'en');
-      params.append('tl', 'pt');
-      params.append('dt', 't');
-      
-      chunk.forEach(text => {
-        const cleanText = text ? text.replace(/\r?\n/g, ' ') : '';
-        params.append('q', cleanText.trim() ? cleanText : ' ');
-      });
+    await Promise.all(currentBatch.map(async (chunk, batchIdx) => {
+      const globalOffset = (i + batchIdx) * CHUNK_SIZE;
+      const joinedText = chunk.map(t => (t || '').replace(/\r?\n/g, ' ')).join('\n');
 
-      const response = await http.post('https://translate.googleapis.com/translate_a/single', params, {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
-        timeout: 6000
-      });
+      try {
+        const params = new URLSearchParams();
+        params.append('client', 'gtx');
+        params.append('sl', 'en');
+        params.append('tl', 'pt');
+        params.append('dt', 't');
+        params.append('q', joinedText);
 
-      if (response.data && Array.isArray(response.data)) {
-        const data = response.data;
-        chunk.forEach((originalText, idx) => {
-          try {
-            const item = data[idx];
-            if (item && item[0]) {
-              const translated = item[0].map(s => s[0]).join('');
-              results.push(translated || originalText);
-            } else {
-              results.push(originalText);
-            }
-          } catch (e) {
-            results.push(originalText);
-          }
+        const response = await http.post('https://translate.googleapis.com/translate_a/single', params.toString(), {
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+          timeout: 4000
         });
-      } else {
-        results.push(...chunk);
-      }
-    } catch (err) {
-      console.error(`[Google POST Batch Error]:`, err?.message || err);
-      
-      // Resgate linha a linha se o lote falhar
-      for (const line of chunk) {
-        if (!line || !line.trim()) {
-          results.push(line);
-          continue;
-        }
-        try {
-          const p = new URLSearchParams();
-          p.append('client', 'gtx');
-          p.append('sl', 'en');
-          p.append('tl', 'pt');
-          p.append('dt', 't');
-          p.append('q', line.replace(/\r?\n/g, ' '));
-          
-          const res = await http.post('https://translate.googleapis.com/translate_a/single', p, {
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
-            timeout: 2500
-          });
-          
-          if (res.data && res.data[0]) {
-            const trans = res.data[0].map(s => s[0]).join('');
-            results.push(trans || line);
-          } else {
-            results.push(line);
-          }
-        } catch (e) {
-          results.push(line);
-        }
-      }
-    }
 
-    await new Promise(resolve => setTimeout(resolve, 50));
+        if (response.data && response.data[0]) {
+          const fullTranslated = response.data[0].map(item => item[0]).join('');
+          const lines = fullTranslated.split('\n');
+
+          chunk.forEach((orig, idx) => {
+            results[globalOffset + idx] = lines[idx] ? lines[idx].trim() : orig;
+          });
+        } else {
+          chunk.forEach((orig, idx) => { results[globalOffset + idx] = orig; });
+        }
+      } catch (err) {
+        console.error(`[Google Chunk Error]:`, err?.message);
+        chunk.forEach((orig, idx) => { results[globalOffset + idx] = orig; });
+      }
+    }));
   }
 
   return results;
@@ -115,7 +84,7 @@ async function translateWithGoogleFast(texts) {
 
 const manifest = {
   id: 'org.comunidade.tradutor.ptpt',
-  version: '1.7.0',
+  version: '1.8.0',
   name: 'Tradutor de Legendas (EN -> PT-PT)',
   description: 'Traduz automaticamente legendas de Inglês para Português de Portugal.',
   resources: ['subtitles'],
